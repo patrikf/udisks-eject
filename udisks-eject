@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby1.9.1
+#
+# udisks-eject: A tool to eject removable devices using udisks. Contrary to
+#
+# Copyright 2014 Patrik Fimml <patrik@fimml.at>
+
+require "dbus"
+require "pp"
+require "optparse"
+require "ostruct"
+
+@options = OpenStruct.new
+@options.dry_run = false
+
+optparser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{$0} [options] DEVICE"
+  opts.separator ""
+  opts.separator <<-EOF
+Prepare a device for removal using the udisks(7) service. This tool will first
+unmount partitions and tear down LUKS mappings before attempting to detach the
+device.
+
+DEVICE can be any device file related to the device, such as the block device
+(e.g. /dev/sda), a partition (/dev/sda1) or a crypto mapping (/dev/dm-0).
+    EOF
+  opts.separator ""
+  opts.separator "Options:"
+  opts.on("-n", "--dry-run",
+          "Only show actions that would be performed.") do
+    @options.dry_run = true
+  end
+end
+optparser.parse!
+
+if ARGV.length != 1
+  puts optparser.banner
+  exit 1
+end
+@options.device = ARGV[0]
+
+$visited = []
+
+def unmount(oid)
+  return if $visited.include? oid
+  $visited.push oid
+
+  puts "unmounting #{oid}"
+
+  device = @udisks_service.object(oid)
+  device.introspect
+  device.default_iface = "org.freedesktop.UDisks.Device"
+  props = device["org.freedesktop.DBus.Properties"].GetAll("org.freedesktop.UDisks.Device")[0]
+  #pp props
+  if props["DeviceIsMounted"]
+    device.FilesystemUnmount([]) unless @options.dry_run
+  end
+  if props["DeviceIsLuks"]
+    # first unmount the LUKS partition
+    unmount(props["LuksHolder"])
+    device.LuksLock([]) unless @options.dry_run
+  end
+  if props["DeviceIsDrive"] and props["DriveCanDetach"]
+    # enumerate partitions
+    @udisks.EnumerateDevices[0].select do |sub_oid|
+      sub_device = @udisks_service.object(sub_oid)
+      sub_device.introspect
+      sub_device.default_iface = "org.freedesktop.UDisks.Device"
+      sub_props = sub_device["org.freedesktop.DBus.Properties"].GetAll("org.freedesktop.UDisks.Device")[0]
+      if sub_props["PartitionSlave"] == oid
+        unmount(sub_oid)
+      end
+    end
+    device.DriveDetach([]) unless @options.dry_run
+  end
+  if props["PartitionSlave"] != "/"
+    #puts "slave of = #{props["PartitionSlave"]}"
+    unmount props["PartitionSlave"]
+  end
+end
+
+@bus = DBus::SystemBus.instance
+@udisks_service = @bus.service("org.freedesktop.UDisks")
+@udisks = @udisks_service.object("/org/freedesktop/UDisks")
+@udisks.introspect
+@udisks.default_iface = "org.freedesktop.UDisks"
+
+device_oid = @udisks.FindDeviceByDeviceFile(@options.device)[0]
+unmount(device_oid)
+
